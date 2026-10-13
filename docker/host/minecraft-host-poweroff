@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+CONFIG=/etc/default/minecraft-discord-bot
+if [ ! -r "$CONFIG" ]; then
+    echo "Missing $CONFIG" >&2
+    exit 1
+fi
+. "$CONFIG"
+
+case "${MINECRAFT_SYSTEMD_UNIT:-}" in
+    ""|*[!A-Za-z0-9_.@:-]*)
+        echo "Invalid MINECRAFT_SYSTEMD_UNIT" >&2
+        exit 1
+        ;;
+esac
+
+state=$(/usr/bin/systemctl show --property=ActiveState --value "$MINECRAFT_SYSTEMD_UNIT")
+case "$state" in
+    active|activating|deactivating|reloading)
+        echo "Minecraft service is active; leaving host powered on"
+        exit 0
+        ;;
+esac
+
+exec /usr/bin/systemctl poweroff

@@ -1,3 +1,4 @@
 # Documentation
 
-Place project documentation and supporting reference material here.
+See [SETUP.md](SETUP.md) for installation, SSH host-control setup, configuration,
+and operating guidance.
