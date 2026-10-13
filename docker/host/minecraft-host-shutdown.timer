@@ -1,0 +1,7 @@
+[Unit]
+Description=Power off the host 15 minutes after Minecraft stops
+
+[Timer]
+OnActiveSec=15min
+AccuracySec=1s
+Unit=minecraft-host-shutdown.service
