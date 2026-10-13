@@ -46,11 +46,12 @@ type fakeHost struct {
 	starts    int
 	scheduled int
 	canceled  int
+	startErr  error
 }
 
 func (f *fakeHost) StartMinecraft(context.Context) error {
 	f.starts++
-	return nil
+	return f.startErr
 }
 
 func (f *fakeHost) ScheduleShutdown(context.Context) error {
@@ -155,5 +156,22 @@ func TestStartStartsMinecraftServiceWhenHostIsReachable(t *testing.T) {
 	}
 	if waker.calls != 0 {
 		t.Errorf("Wake-on-LAN calls = %d, want 0 for an SSH-reachable host", waker.calls)
+	}
+}
+
+func TestStartFallsBackToWakeOnLANWhenSSHIsUnavailable(t *testing.T) {
+	minecraft := &fakeMinecraft{responses: []playerResponse{
+		{err: errors.New("RCON unavailable")},
+		{count: 0},
+	}}
+	waker := &fakeWaker{}
+	host := &fakeHost{startErr: errors.New("SSH unavailable")}
+	manager := NewManager(minecraft, waker, host)
+
+	if _, err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if waker.calls != 1 {
+		t.Errorf("Wake-on-LAN calls = %d, want 1", waker.calls)
 	}
 }

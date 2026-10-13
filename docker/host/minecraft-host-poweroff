@@ -6,6 +6,12 @@ if [ ! -r "$CONFIG" ]; then
     echo "Missing $CONFIG" >&2
     exit 1
 fi
+owner=$(/usr/bin/stat -c %u "$CONFIG")
+mode=$(/usr/bin/stat -c %a "$CONFIG")
+if [ "$owner" != 0 ] || [ "$mode" != 644 ]; then
+    echo "$CONFIG must be owned by root with mode 0644" >&2
+    exit 1
+fi
 . "$CONFIG"
 
 case "${MINECRAFT_SYSTEMD_UNIT:-}" in

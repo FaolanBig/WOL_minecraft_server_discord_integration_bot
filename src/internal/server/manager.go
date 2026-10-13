@@ -296,6 +296,15 @@ func (m *Manager) reconcileHostShutdown(ctx context.Context, schedule bool) erro
 	}
 	defer unlock(m.hostMu)
 
+	if !schedule {
+		m.stateMu.Lock()
+		alreadyCancelled := m.hostTimerKnown && !m.hostTimerScheduled
+		m.stateMu.Unlock()
+		if alreadyCancelled {
+			return nil
+		}
+	}
+
 	var err error
 	if schedule {
 		err = m.host.ScheduleShutdown(hostCtx)
