@@ -1,6 +1,0 @@
-[Unit]
-Description=Power off the host if Minecraft remains stopped
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/minecraft-host-poweroff

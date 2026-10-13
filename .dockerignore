@@ -1,6 +1,0 @@
-.git
-.env
-.env.*
-!.env.example
-secrets/
-**/secrets/
