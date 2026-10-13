@@ -23,6 +23,85 @@ The container uses host networking because LAN broadcast packets generally do
 not pass through Docker's default bridged network. Configure the host firewall
 to allow the bot to reach the Minecraft RCON port and send UDP broadcasts.
 
+## Architecture and lifecycle
+
+The application is split into small packages so Discord, networking, and
+Minecraft behavior can be maintained separately:
+
+| Package | Responsibility |
+| --- | --- |
+| `src/internal/config` | Read and validate required environment settings. |
+| `src/internal/bot` | Register guild slash commands, authorize roles, and reply to interactions. |
+| `src/internal/wol` | Construct and send the UDP magic packet. |
+| `src/internal/minecraft` | Exchange bounded, validated Minecraft Java RCON packets and parse `list` output. |
+| `src/internal/host` | Run the three allowlisted SSH commands with public-key authentication and pinned host keys. |
+| `src/internal/server` | Serialize lifecycle work, poll RCON, and coordinate server and host shutdown. |
+
+The `src/main.go` entry point loads configuration, constructs the integrations,
+opens Discord's gateway, registers the commands, starts the monitor, and
+handles termination signals. There is no database: the first-stage empty
+server timer is in memory. The second-stage timer is owned by systemd on the
+Minecraft host and survives bot restarts.
+
+### Starting Minecraft
+
+1. `/start` acknowledges the interaction immediately so Discord's response
+   deadline is met.
+2. The bot checks RCON first. If it responds, the command reports that Minecraft
+   is already available.
+3. If RCON is unreachable, the bot tries the restricted SSH `start-minecraft`
+   command. On a running host, that command cancels the delayed power-off timer
+   and starts the configured Minecraft systemd service.
+4. If SSH is not reachable, the bot sends a Wake-on-LAN packet, then retries
+   SSH and RCON until Minecraft responds or `STARTUP_TIMEOUT` expires.
+5. The bot reports readiness only after a successful RCON `list` response. A
+   successful service start or a sent magic packet alone is not treated as
+   proof that Minecraft is ready.
+
+### Stopping Minecraft and then the host
+
+1. The monitor polls Java RCON every 30 seconds. A valid `list` response with
+   zero online players starts the 15-minute Minecraft idle countdown.
+2. A response with one or more players resets the countdown. An RCON failure
+   also clears the in-memory countdown; the bot never stops Minecraft from a
+   stale player count.
+3. When the empty countdown reaches 15 minutes, the monitor obtains a fresh
+   player list while serializing RCON operations. It sends `stop` only if this
+   final check still reports zero players.
+4. Once RCON becomes unreachable after the stop, the bot asks the host helper
+   to start the `minecraft-host-shutdown.timer`. The host timer waits another
+   15 minutes before running its shutdown service.
+5. The host shutdown helper checks the configured systemd unit's current state.
+   If Minecraft is active, activating, deactivating, or reloading, it leaves
+   the host on. Otherwise it requests `systemctl poweroff`.
+6. A later `/start` stops the host timer and service before starting Minecraft.
+
+With a 30-second monitor interval, each time-based action occurs on the first
+poll after its threshold, not at an exact wall-clock second. The Minecraft
+idle period can therefore exceed 15 minutes by up to approximately one poll
+interval, plus command latency. If the server is empty but RCON temporarily
+fails, a new 15-minute empty period begins after RCON successfully recovers.
+The host power-off delay starts after Minecraft is no longer reachable through
+RCON, not at the moment the `stop` command is sent.
+
+### Availability and recovery decisions
+
+- If RCON fails while the host is still online, the bot may schedule the
+  second-stage timer. The host-side power-off helper checks the Minecraft
+  systemd unit again before powering off.
+- If the host is powered off, SSH cannot schedule or cancel its timer. Repeated
+  monitor checks retry the schedule operation; `/start` sends Wake-on-LAN and
+  retries the SSH service-start operation after the host becomes reachable.
+- If SSH or the helper is misconfigured, a magic packet may still wake the
+  machine, but Minecraft will not start unless the host has another startup
+  path. The bot reports an error at the end of `STARTUP_TIMEOUT`; inspect its
+  logs and host SSH/systemd logs.
+- If the bot restarts while Minecraft is online and empty, a new 15-minute
+  countdown begins after the next successful monitor check. The second-stage
+  timer already scheduled by the host remains in systemd.
+- A successful remote `stop` request is logged. If it fails, the bot retries
+  on a subsequent monitor cycle while the server remains empty.
+
 ## Configure Minecraft
 
 In the server's `server.properties`, configure RCON with a long, unique
@@ -74,7 +153,9 @@ to an allowlisted helper, and `sudo` permits only that helper.
 On the Minecraft host:
 
 1. Create the dedicated SSH account and install the helper scripts and systemd
-   units from `docker/host/`:
+   units from `docker/host/`. Run these commands from the repository root on a
+   checked-out copy on the Minecraft host, or transfer the listed files to it
+   first:
 
    ```sh
    sudo useradd --create-home --shell /bin/sh minecraft-bot
@@ -99,7 +180,8 @@ On the Minecraft host:
    ```
 
    If the Minecraft unit has another name, use it here. The same file is read
-   by the restricted helper and by the power-off check.
+   by the restricted helper and by the power-off check. Both scripts reject
+   this file unless it is root-owned with mode `0644`; keep it that way.
 
 3. Allow the SSH account to run only the root helper:
 
@@ -238,6 +320,106 @@ The bot is intended to send Wake-on-LAN from a Linux Docker host on the server's
 LAN. Some routers, VLANs, Wi-Fi adapters, and host firewalls block broadcasts;
 verify packet delivery and BIOS/network-adapter wake settings if `/start` times
 out.
+
+## Operations and troubleshooting
+
+### Routine operations
+
+View logs and service state:
+
+```sh
+docker compose ps
+docker compose logs --since=1h minecraft-discord-bot
+```
+
+Rebuild after updating Go source or the image definition:
+
+```sh
+docker compose up --build -d
+```
+
+After changing `.env`, recreate the container so it receives the updated
+environment:
+
+```sh
+docker compose up -d --force-recreate
+```
+
+After changing only host helper scripts or systemd unit files, reinstall the
+modified files on the Minecraft host and reload systemd:
+
+```sh
+sudo systemctl daemon-reload
+```
+
+To inspect the host-side timer and Minecraft service:
+
+```sh
+sudo systemctl status minecraft.service
+sudo systemctl status minecraft-host-shutdown.timer
+sudo systemctl status minecraft-host-shutdown.service
+sudo journalctl -u minecraft-host-shutdown.service --since=today
+```
+
+Substitute the configured Minecraft unit name when it is not `minecraft.service`.
+The timer is not enabled at boot; the bot starts it after observing that
+Minecraft's RCON endpoint is unavailable. Do not enable the shutdown timer
+permanently.
+
+### Troubleshooting checklist
+
+| Symptom | Checks |
+| --- | --- |
+| Bot container exits immediately | Inspect `docker compose logs`. Check all required environment variables, the Discord token, the application and guild IDs, and that the SSH key and `known_hosts` files exist and can be read by UID `10001`. |
+| Slash commands are missing | Check the bot was invited with `applications.commands`, the configured application/guild IDs are correct, and the bot can use the Discord API. Restarting the service registers the guild commands again. |
+| User is denied a command | Verify the member has one of the role IDs in `DISCORD_ALLOWED_ROLE_IDS` in the configured guild. Use numeric role IDs separated by commas. |
+| `/status` reports no RCON connection | Check `enable-rcon`, the configured RCON port/password, firewall rules, the address reachable from the Docker host, and that the Minecraft process is running. RCON should not be exposed publicly. |
+| `/start` times out before Minecraft is ready | Check the server MAC address, BIOS and NIC Wake-on-LAN settings, broadcast routing, and host firewall. Then test SSH independently, confirm `known_hosts` has the verified host key and correct port, and inspect the SSH helper and Minecraft systemd logs. |
+| Host wakes but Minecraft does not start | Confirm SSH becomes available after boot, the dedicated key is accepted, the forced command and sudoers rule match the documented setup, the configured systemd unit exists, and its Minecraft user can access the working directory and JAR. |
+| Minecraft stops but host stays on | Confirm RCON becomes unreachable after `stop`, SSH remains reachable, the systemd timer/service units were installed, the root helper config names the right Minecraft unit, and the helper can run `systemctl poweroff`. Check `journalctl` for the timer service. |
+| Host shuts down while Minecraft should be running | Do not rely on RCON alone as the host safety check. Confirm the configured systemd unit correctly represents the Minecraft process and that the host helper's active-state check uses that unit. Check for multiple Minecraft processes outside systemd. |
+| Magic packet is sent but host stays off | WOL requires compatible firmware/NIC settings and a packet path to the server's LAN. Try the subnet-directed broadcast, check VLAN/router broadcast policy, and inspect the receiving adapter. |
+
+### Logging and sensitive data
+
+The bot writes structured JSON logs to standard output; Compose captures these
+logs. Logs contain operational errors, IDs, and player counts, but do not
+intentionally log player names, the Discord token, RCON password, or SSH
+private key. Keep log access restricted as appropriate.
+
+The Compose `.env` file supplies the bot token and RCON password to the
+container, so Docker administrators can inspect them. Keep `.env` mode `0600`,
+exclude it from version control and backups that are not protected, and rotate
+credentials if they are exposed. The SSH private key is mounted read-only from
+`secrets/`; protect that directory and use a dedicated restricted key. Verify
+the SSH host key fingerprint using a trusted channel before adding it to
+`known_hosts`.
+
+The SSH account's authorized key is constrained to the `minecraft-discord-control`
+forced command. That script accepts only three fixed requests; the root helper
+uses those values to invoke a fixed set of `systemctl` actions. The config
+`/etc/default/minecraft-discord-bot` is sourced by root-owned scripts: keep it
+owned by root and not writable by the SSH account or other untrusted users.
+Review the sudoers entry with `visudo`; do not grant the SSH account general
+passwordless sudo.
+
+## Building and testing
+
+Use the Go version declared in [`../go.mod`](../go.mod). From the repository
+root:
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+go build -o /tmp/minecraft-discord-bot ./src
+```
+
+The unit tests cover Java player-count parsing, RCON frame encoding/validation,
+configuration parsing, Wake-on-LAN packet construction, and server lifecycle
+decisions. They do not test real Discord credentials, LAN broadcasts, physical
+Wake-on-LAN behavior, systemd, or power-off. Test deployment and shutdown
+behavior on a non-production host before relying on it.
 
 ## Configuration reference
 

@@ -31,7 +31,7 @@ func (r *RCON) Players(ctx context.Context) (int, error) {
 	}
 	count, err := ParsePlayerCount(response)
 	if err != nil {
-		return 0, fmt.Errorf("parse Minecraft RCON player list %q: %w", response, err)
+		return 0, fmt.Errorf("parse Minecraft RCON player list: %w", err)
 	}
 	return count, nil
 }
@@ -68,7 +68,7 @@ func (r *RCON) Execute(ctx context.Context, command string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read Minecraft RCON authentication: %w", err)
 	}
-	if auth.id != authID {
+	if auth.id != authID || auth.packetType != 2 {
 		return "", errors.New("Minecraft RCON authentication failed")
 	}
 
@@ -80,15 +80,16 @@ func (r *RCON) Execute(ctx context.Context, command string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read Minecraft RCON response: %w", err)
 	}
-	if response.id != commandID {
-		return "", fmt.Errorf("unexpected Minecraft RCON response ID %d", response.id)
+	if response.id != commandID || response.packetType != 0 {
+		return "", fmt.Errorf("unexpected Minecraft RCON response packet (ID %d, type %d)", response.id, response.packetType)
 	}
 	return response.body, nil
 }
 
 type packet struct {
-	id   int32
-	body string
+	id         int32
+	packetType int32
+	body       string
 }
 
 func writePacket(w io.Writer, id, packetType int32, body string) error {
@@ -128,7 +129,8 @@ func readPacket(r io.Reader) (packet, error) {
 		return packet{}, errors.New("malformed Minecraft RCON packet terminator")
 	}
 	return packet{
-		id:   int32(binary.LittleEndian.Uint32(data[:4])),
-		body: string(data[8 : len(data)-2]),
+		id:         int32(binary.LittleEndian.Uint32(data[:4])),
+		packetType: int32(binary.LittleEndian.Uint32(data[4:8])),
+		body:       string(data[8 : len(data)-2]),
 	}, nil
 }
