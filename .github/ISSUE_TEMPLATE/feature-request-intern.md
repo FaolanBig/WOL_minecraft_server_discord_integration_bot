@@ -1,8 +1,8 @@
 ---
-name: Feature request
-about: Suggest an idea for this project
+name: Feature request intern
+about: Suggest an idea for this project (for the bot)
 title: ''
-labels: ''
+labels: feature request intern
 assignees: ''
 
 ---
